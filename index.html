@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Coursera Study Buddy</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 { color: #2196F3; }
+        .container {
+            border: 1px solid #e0e0e0;
+            border-radius: 5px;
+            padding: 20px;
+            margin-top: 20px;
+            background-color: #f9f9f9;
+        }
+        .info {
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+        code {
+            background-color: #f1f1f1;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+        .button {
+            display: inline-block;
+            background-color: #2196F3;
+            color: white;
+            padding: 10px 20px;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-top: 20px;
+            font-weight: bold;
+        }
+        .button:hover {
+            background-color: #0b7dda;
+        }
+    </style>
+</head>
+<body>
+    <h1>Coursera Study Buddy</h1>
+    <div class="container">
+        <p>Welcome to the Coursera Study Buddy landing page.</p>
+        
+        <div class="info">
+            <p><strong>Note:</strong> The full Streamlit application cannot be hosted on Vercel due to size limitations.</p>
+            <p>Please visit the Streamlit Cloud-hosted version to use the complete application.</p>
+            <a href="https://streamlit.io/cloud" class="button">Launch Streamlit App</a>
+        </div>
+        
+        <h2>About the Project</h2>
+        <p>Coursera Study Buddy helps you interact with Coursera transcripts using AI to:</p>
+        <ul>
+            <li>Summarize course content</li>
+            <li>Ask questions about the material</li>
+            <li>Generate practice quizzes</li>
+            <li>Prepare for exams</li>
+        </ul>
+        
+        <h2>Features</h2>
+        <ul>
+            <li><strong>Upload and Process Transcripts:</strong> Easily upload Coursera PDF transcripts</li>
+            <li><strong>Generate Summaries:</strong> Get concise summaries of course material</li>
+            <li><strong>Q&A:</strong> Ask questions about the content and get AI-powered answers</li>
+            <li><strong>Quiz Creation:</strong> Automatically generate quizzes to test your knowledge</li>
+            <li><strong>Exam Preparation:</strong> Tools to help you prepare for assessments</li>
+        </ul>
+    </div>
+    
+    <footer style="margin-top: 40px; text-align: center; color: #666; font-size: 0.8em;">
+        <p>Coursera Study Buddy © 2023</p>
+    </footer>
+    
+    <script>
+        // Simple script to update the copyright year automatically
+        document.addEventListener('DOMContentLoaded', function() {
+            const year = new Date().getFullYear();
+            document.querySelector('footer p').textContent = `Coursera Study Buddy © ${year}`;
+        });
+    </script>
+</body>
+</html>

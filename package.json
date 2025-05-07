@@ -1,0 +1,10 @@
+{
+  "name": "coursera-study-buddy-landing",
+  "version": "1.0.0",
+  "description": "Landing page for Coursera Study Buddy",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"No tests defined\""
+  },
+  "dependencies": {}
+} 
