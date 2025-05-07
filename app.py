@@ -578,15 +578,44 @@ def get_vector_index():
         st.error(f"Error connecting to Pinecone: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-def get_gemini_response(prompt, context=None):
-    """Get response from Gemini model"""
+def get_gemini_response(prompt, context=None, temperature=0.2, max_tokens=4000, top_k=40, top_p=0.95, response_type="comprehensive"):
+    """Get response from Gemini model with customizable parameters
+    
+    Args:
+        prompt: The prompt to send to Gemini
+        context: Optional additional context
+        temperature: Controls randomness (0.0-1.0)
+        max_tokens: Maximum tokens to generate
+        top_k: Limits vocabulary to top K choices at each step
+        top_p: Limits vocabulary to most likely tokens with cumulative probability
+        response_type: Type of response desired ("brief", "comprehensive", "detailed")
+    """
     try:
         if context:
             full_prompt = f"Context: {context}\n\nQuestion: {prompt}"
         else:
             full_prompt = prompt
+        
+        # Add specific instructions based on response type
+        if response_type == "comprehensive":
+            full_prompt += "\n\nProvide a comprehensive answer with complete explanations, examples, and details. Aim for 150-300 words."
+        elif response_type == "detailed":
+            full_prompt += "\n\nProvide an extremely detailed answer with thorough explanations, multiple examples, and in-depth analysis. Aim for 300+ words."
+        elif response_type == "brief":
+            full_prompt += "\n\nProvide a concise answer that covers the key points efficiently."
             
-        response = gemini_model.generate_content(full_prompt)
+        # Configure generation parameters
+        generation_config = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_output_tokens": max_tokens,
+        }
+            
+        response = gemini_model.generate_content(
+            full_prompt, 
+            generation_config=generation_config
+        )
         return response.text
     except Exception as e:
         st.error(f"Error getting Gemini response: {str(e)}")
@@ -838,7 +867,16 @@ def upsert_to_pinecone(text, metadata):
 
 def semantic_search_with_pinecone(query, course_name=None, week_number=None, top_k=5):
     """
-    Perform semantic search using Pinecone directly
+    Perform semantic search using Pinecone directly with improved relevance and formatting
+    
+    Args:
+        query: The search query
+        course_name: Optional filter for course name
+        week_number: Optional filter for week number
+        top_k: Number of chunks to retrieve
+        
+    Returns:
+        Formatted text of retrieved chunks with metadata
     """
     try:
         # If indexing is disabled, but search is still enabled
@@ -876,51 +914,76 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
         
         if not query_embedding:
             return ""
+        
+        # Retrieve slightly more chunks than requested to allow for post-processing filtering
+        actual_top_k = min(top_k * 2, 20)  # Retrieve up to 2x requested chunks, max 20
             
         # Build filter if needed
         filter_dict = {}
         if course_name:
             filter_dict["course_name"] = {"$eq": course_name}
         if week_number:
-            filter_dict["week_number"] = {"$eq": week_number}
-        
-        # Track which approach worked for logging
-        search_method_used = "standard"
+            filter_dict["week_number"] = {"$eq": str(week_number)}  # Convert to string as metadata is stored as strings
         
         # Execute the query
         try:
             results = pinecone_index.query(
                 namespace="coursera",
                 vector=query_embedding,
-                top_k=top_k,
+                top_k=actual_top_k,
                 include_metadata=True,
                 filter=filter_dict if filter_dict else None
             )
             
-            # Extract text from matches
-            retrieved_texts = []
-            scores = []
+            # Extract text and organize with metadata
+            retrieved_chunks = []
             for match in results.matches:
                 if match.metadata and 'text' in match.metadata:
-                    retrieved_texts.append(match.metadata['text'])
-                    scores.append(match.score)
+                    # Store text with metadata and score
+                    chunk_info = {
+                        'text': match.metadata['text'],
+                        'score': match.score,
+                        'course': match.metadata.get('course_name', 'Unknown'),
+                        'week': match.metadata.get('week_number', 'Unknown'),
+                        'source': match.metadata.get('transcript_name', 'Unknown'),
+                        'chunk_num': match.metadata.get('chunk_number', '0')
+                    }
+                    retrieved_chunks.append(chunk_info)
+            
+            # Filter and sort chunks to include only most relevant ones
+            # 1. Filter by minimum score threshold
+            min_score_threshold = 0.6  # Only keep chunks with at least this relevance score
+            filtered_chunks = [chunk for chunk in retrieved_chunks if chunk['score'] > min_score_threshold]
+            
+            # Ensure we have at least a few chunks even if scores are low
+            if len(filtered_chunks) < min(3, top_k):
+                # Fall back to just taking top few by score
+                filtered_chunks = sorted(retrieved_chunks, key=lambda x: x['score'], reverse=True)[:min(3, top_k)]
+            
+            # Limit to requested top_k
+            filtered_chunks = filtered_chunks[:top_k]
             
             # Log search quality
-            if scores:
-                avg_score = sum(scores) / len(scores)
+            if filtered_chunks:
+                avg_score = sum(chunk['score'] for chunk in filtered_chunks) / len(filtered_chunks)
                 st.write(f"📊 Search quality: {avg_score:.2f} (higher is better)")
+                if avg_score < 0.7:
+                    st.info("💡 Search quality is moderate. Try rephrasing your question for better results.")
             
-            if not retrieved_texts:
-                st.warning("No relevant vectors found in Pinecone. This may happen if you haven't indexed this content before.")
+            if not filtered_chunks:
+                st.warning("No relevant vectors found in Pinecone with sufficient relevance.")
                 return ""
                 
-            # Format the retrieved texts with their relevance scores
-            formatted_texts = []
-            for i, (text, score) in enumerate(zip(retrieved_texts, scores)):
-                # Add a section header with relevance score
-                formatted_texts.append(f"--- Segment {i+1} (Relevance: {score:.2f}) ---\n{text}\n")
+            # Format chunks with clear section headers including source information
+            formatted_text = ""
+            for i, chunk in enumerate(filtered_chunks):
+                # Add a section header with relevance score and source information
+                formatted_text += f"SECTION {i+1} - {chunk['course']}, Week {chunk['week']} (Relevance: {chunk['score']:.2f})\n"
+                formatted_text += f"Source: {chunk['source']}\n"
+                formatted_text += "-" * 80 + "\n"
+                formatted_text += chunk['text'].strip() + "\n\n"
                 
-            return "\n\n".join(formatted_texts)
+            return formatted_text
         except Exception as query_error:
             st.warning(f"Error in standard Pinecone query: {str(query_error)}")
             search_method_used = "fallback"
@@ -932,13 +995,12 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
                     results = pinecone_index.query(
                         namespace="coursera",
                         vector=query_embedding,
-                        top_k=top_k * 2,  # Get more results since we'll filter manually
+                        top_k=actual_top_k,
                         include_metadata=True
                     )
                     
                     # Manually filter results
-                    filtered_texts = []
-                    scores = []
+                    filtered_chunks = []
                     for match in results.matches:
                         metadata = match.metadata
                         if not metadata:
@@ -947,22 +1009,44 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
                         # Apply our filters manually
                         if course_name and metadata.get('course_name') != course_name:
                             continue
-                        if week_number and metadata.get('week_number') != week_number:
+                        if week_number and metadata.get('week_number') != str(week_number):
                             continue
                             
                         if 'text' in metadata:
-                            filtered_texts.append(metadata['text'])
-                            scores.append(match.score)
+                            # Build chunk info
+                            chunk_info = {
+                                'text': metadata['text'],
+                                'score': match.score,
+                                'course': metadata.get('course_name', 'Unknown'),
+                                'week': metadata.get('week_number', 'Unknown'),
+                                'source': metadata.get('transcript_name', 'Unknown'),
+                                'chunk_num': metadata.get('chunk_number', '0')
+                            }
+                            filtered_chunks.append(chunk_info)
                     
-                    # Format the retrieved texts with their relevance scores
-                    formatted_texts = []
-                    for i, (text, score) in enumerate(zip(filtered_texts, scores)):
-                        # Add a section header with relevance score
-                        formatted_texts.append(f"--- Segment {i+1} (Relevance: {score:.2f}) ---\n{text}\n")
-                            
-                    if filtered_texts:
-                        st.info(f"Used fallback search method with manual filtering ({len(filtered_texts)} results)")
-                        return "\n\n".join(formatted_texts)
+                    # Apply minimum score threshold
+                    filtered_chunks = [chunk for chunk in filtered_chunks if chunk['score'] > 0.6]
+                    
+                    # Ensure we have at least a few chunks
+                    if len(filtered_chunks) < min(3, top_k):
+                        # Fall back to just taking top few by score
+                        filtered_chunks = sorted(filtered_chunks, key=lambda x: x['score'], reverse=True)[:min(3, top_k)]
+                    
+                    # Limit to requested top_k
+                    filtered_chunks = filtered_chunks[:top_k]
+                    
+                    # Format results
+                    formatted_text = ""
+                    for i, chunk in enumerate(filtered_chunks):
+                        # Add a section header with relevance score and source information
+                        formatted_text += f"SECTION {i+1} - {chunk['course']}, Week {chunk['week']} (Relevance: {chunk['score']:.2f})\n"
+                        formatted_text += f"Source: {chunk['source']}\n"
+                        formatted_text += "-" * 80 + "\n"
+                        formatted_text += chunk['text'].strip() + "\n\n"
+                        
+                    if filtered_chunks:
+                        st.info(f"Used fallback search method with manual filtering ({len(filtered_chunks)} results)")
+                        return formatted_text
                     else:
                         return ""
                 except Exception as fallback_error:
@@ -2113,6 +2197,34 @@ with tab3:
                           help="Higher values retrieve more content but may include less relevant information")
         use_chat_history = st.checkbox("Use chat history for context", value=True,
                                       help="Includes previous messages as context for better continuity")
+        
+        # Add answer style controls
+        st.write("### Answer Settings")
+        answer_style = st.select_slider(
+            "Answer Detail Level",
+            options=["Brief", "Balanced", "Comprehensive", "Detailed"],
+            value="Comprehensive",
+            help="Controls how detailed the AI's answers will be"
+        )
+        
+        # Map slider values to actual settings
+        detail_mapping = {
+            "Brief": {"type": "brief", "temp": 0.1, "max_tokens": 1500},
+            "Balanced": {"type": "comprehensive", "temp": 0.2, "max_tokens": 2500},
+            "Comprehensive": {"type": "comprehensive", "temp": 0.3, "max_tokens": 3500},
+            "Detailed": {"type": "detailed", "temp": 0.4, "max_tokens": 4500}
+        }
+        
+        # Show advanced options
+        show_advanced = st.checkbox("Show Advanced Settings", value=False)
+        if show_advanced:
+            col1, col2 = st.columns(2)
+            with col1:
+                custom_temp = st.slider("Temperature", min_value=0.0, max_value=1.0, value=detail_mapping[answer_style]["temp"], step=0.05,
+                                       help="Higher values = more creative, lower = more focused")
+            with col2:
+                custom_max_tokens = st.slider("Max Output Tokens", min_value=500, max_value=8000, value=detail_mapping[answer_style]["max_tokens"], step=500,
+                                           help="Maximum length of the generated answer")
     
     # Get user input
     user_query = st.chat_input("Ask about your Coursera content")
@@ -2184,20 +2296,51 @@ with tab3:
                         st.write("The following content was retrieved from the vector database:")
                         st.text(retrieved_text[:1500] + "..." if len(retrieved_text) > 1500 else retrieved_text)
                     
+                    # Get selected detail level parameters
+                    if show_advanced:
+                        response_type = detail_mapping[answer_style]["type"]
+                        temperature = custom_temp
+                        max_tokens = custom_max_tokens
+                    else:
+                        response_type = detail_mapping[answer_style]["type"]
+                        temperature = detail_mapping[answer_style]["temp"]
+                        max_tokens = detail_mapping[answer_style]["max_tokens"]
+                    
                     # Generate answer with Gemini
-                    st.info("🤖 Generating answer based on retrieved content...")
-                    prompt = f"""You are an educational AI assistant helping students understand Coursera content.
+                    st.info(f"🤖 Generating {answer_style.lower()} answer based on retrieved content...")
                     
-                    Answer the question based ONLY on the following information from course materials:
+                    # Build a better prompt for the model with more detailed instructions
+                    prompt = f"""You are an educational AI assistant helping students understand Coursera content. Your goal is to provide a {answer_style.lower()} response that thoroughly answers the student's question.
+
+CONTEXT INFORMATION FROM COURSE MATERIALS:
+{retrieved_text}
+
+STUDENT QUESTION: 
+{user_query}
+
+YOUR TASK:
+1. Analyze the context information and identify relevant facts, concepts, and details to answer the question
+2. Provide a well-structured, {answer_style.lower()} answer using only information from the course materials
+3. Organize your response with clear paragraph breaks for readability
+4. When appropriate, use bullet points to highlight key points
+5. Include examples where they would help illustrate concepts
+6. If the context information doesn't contain sufficient details to answer the question, acknowledge this gap clearly
+
+Important: Focus ONLY on the information provided in the context. Do not include speculative information or personal opinions. Aim to be educational, precise, and helpful."""
                     
-                    {retrieved_text}
+                    # Add chat history if enabled
+                    if use_chat_history and len(st.session_state.messages) > 1:
+                        # Append recent conversation history for context
+                        prompt += f"\n\nRECENT CONVERSATION HISTORY:\n{context_messages}"
+                        prompt += "\n\nUse this conversation history for context, but focus on answering the current question based on the course materials."
                     
-                    Question: {user_query}
-                    
-                    Answer in a clear, direct manner. Be sure to highlight key concepts and provide well-structured information.
-                    If information to answer the question is not contained in the retrieved content, say so directly."""
-                    
-                    ai_response = get_gemini_response(prompt)
+                    # Generate response with the enhanced parameters
+                    ai_response = get_gemini_response(
+                        prompt, 
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        response_type=response_type
+                    )
                     
                     if not ai_response:
                         ai_response = "I'm having trouble generating a response. Please try again or check the system configuration."
