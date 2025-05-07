@@ -15,12 +15,14 @@ import base64
 import google.generativeai as genai
 import time
 from httpx import Client
+import requests
+import re
 
 # Load environment variables
 load_dotenv()
 
 # Configuration flags - ADD THIS SECTION
-ENABLE_PINECONE_INDEXING = False  # Set to False to disable vector indexing
+ENABLE_PINECONE_INDEXING = True  # Set to True to enable vector indexing
 ENABLE_VECTOR_SEARCH = True  # Allow vector search even if indexing is disabled
 SKIP_VECTOR_STORAGE_WARNING = "⚠️ Vector upload is temporarily disabled. Using existing vectors for search."
 # End configuration flags
@@ -50,15 +52,18 @@ try:
         st.warning("⚠️ Gemini API key not found. Some features may be limited.")
     
     # Supabase
-    supabase_url = os.environ.get("SUPABASE_URL") 
-    supabase_key = os.environ.get("SUPABASE_KEY")
-    supabase_service_key = os.environ.get("SUPABASE_SERVICE_KEY")
+    # First try to get credentials from Streamlit secrets
+    supabase_url = st.secrets.get("SUPABASE_URL")
+    supabase_key = st.secrets.get("SUPABASE_KEY")
+    supabase_service_key = st.secrets.get("SUPABASE_SERVICE_KEY")
     
-    # If any of the keys are missing, try to get them from secrets
-    if not supabase_url or not supabase_key or not supabase_service_key:
-        supabase_url = st.secrets.get("SUPABASE_URL", supabase_url)
-        supabase_key = st.secrets.get("SUPABASE_KEY", supabase_key)
-        supabase_service_key = st.secrets.get("SUPABASE_SERVICE_KEY", supabase_service_key)
+    # Fall back to environment variables if not found in secrets
+    if not supabase_url:
+        supabase_url = os.environ.get("SUPABASE_URL")
+    if not supabase_key:
+        supabase_key = os.environ.get("SUPABASE_KEY")
+    if not supabase_service_key:
+        supabase_service_key = os.environ.get("SUPABASE_SERVICE_KEY")
     
     # Debug information for Supabase credentials
     if not supabase_url or not supabase_key or not supabase_service_key:
@@ -268,112 +273,6 @@ def extract_text_from_file(file_data, file_path):
         st.error(f"Unsupported file type: {file_extension}")
         return ""
 
-# Add this function to verify and refresh Supabase connections
-def verify_supabase_connection():
-    """Verify Supabase connection and refresh if needed"""
-    global supabase
-    
-    try:
-        # Try a simple operation to check connection
-        test_result = supabase.auth.get_session()
-        if test_result:
-            return True
-    except Exception as e:
-        st.warning(f"Supabase connection issue: {str(e)}")
-        
-    # Try to reinitialize the connection
-    try:
-        st.info("Attempting to refresh Supabase connection...")
-        supabase_url = os.environ.get("SUPABASE_URL") 
-        supabase_key = os.environ.get("SUPABASE_KEY")
-        if not supabase_url or not supabase_key:
-            supabase_url = st.secrets.get("SUPABASE_URL")
-            supabase_key = st.secrets.get("SUPABASE_KEY")
-        
-        if supabase_url and supabase_key:
-            supabase = create_client(supabase_url, supabase_key)
-            st.success("Supabase connection refreshed!")
-            return True
-        else:
-            st.error("Supabase credentials not found!")
-            return False
-    except Exception as refresh_error:
-        st.error(f"Failed to refresh Supabase connection: {str(refresh_error)}")
-        return False
-
-# Modify the get_file_from_supabase function to be more resilient
-def get_file_from_supabase(file_path):
-    """Download a file from Supabase storage and return its contents"""
-    global supabase
-    
-    # Sanitize file path - remove any whitespace or newlines
-    clean_path = file_path.strip()
-    
-    # Skip if empty path
-    if not clean_path:
-        return None
-        
-    # Try to get the file from Supabase
-    for attempt in range(2):  # Make up to 2 attempts
-        try:
-            # Ensure connection is valid
-            if attempt > 0:
-                verify_supabase_connection()
-                
-            # Get direct info about the bucket
-            try:
-                all_buckets = supabase.storage.list_buckets()
-                bucket_names = [b.get('name') for b in all_buckets]
-                if 'transcripts' not in bucket_names:
-                    st.error("'transcripts' bucket not found in your Supabase project!")
-                    st.write(f"Available buckets: {', '.join(bucket_names)}")
-                    break
-            except Exception as bucket_error:
-                st.warning(f"Could not check buckets: {str(bucket_error)}")
-            
-            # Try to list files to verify bucket access
-            try:
-                bucket_files = supabase.storage.from_("transcripts").list()
-                st.write(f"Files in Supabase 'transcripts' bucket: {[f.get('name') for f in bucket_files]}")
-                if not any(f.get('name') == clean_path for f in bucket_files):
-                    st.warning(f"File '{clean_path}' not found among the {len(bucket_files)} files in the bucket")
-                    # Look for similar files
-                    similar_files = [f.get('name') for f in bucket_files if f.get('name') and 
-                                    (clean_path.lower() in f.get('name').lower() or 
-                                     f.get('name').lower() in clean_path.lower())]
-                    if similar_files:
-                        st.info(f"Similar files found: {', '.join(similar_files)}")
-                        st.info("If one of these is the file you want, update your database record.")
-            except Exception as list_error:
-                st.warning(f"Could not list files in bucket: {str(list_error)}")
-                
-            # Attempt actual download
-            response = supabase.storage.from_("transcripts").download(clean_path)
-            if response:
-                st.success(f"Successfully downloaded '{clean_path}' from Supabase!")
-                return response
-        except Exception as e:
-            st.error(f"Error downloading file from Supabase (attempt {attempt+1}): {str(e)}")
-            if attempt == 0:
-                st.info("Trying again with refreshed connection...")
-            
-    # If Supabase download failed, try local files
-    st.warning("Supabase download failed. Trying local files...")
-    local_paths = [
-        file_path,  # Try direct path
-        file_path.strip(),  # Try without whitespace
-        os.path.join(os.getcwd(), file_path.strip()),  # Try in current directory
-        os.path.join(os.path.expanduser("~"), "Downloads", file_path.strip())  # Try in Downloads folder
-    ]
-    
-    for path in local_paths:
-        if os.path.exists(path):
-            st.success(f"Found file locally at '{path}', using this instead")
-            with open(path, "rb") as f:
-                return f.read()
-    
-    return None
-
 def extract_text_from_supabase_pdf(file_path):
     """Download a file from Supabase and extract its text"""
     # Clean up the file path - remove leading/trailing whitespace
@@ -488,6 +387,43 @@ def extract_text_from_supabase_pdf(file_path):
     
     # Use the generic extraction function
     return extract_text_from_file(pdf_data, file_path)
+
+# Add this function to verify and refresh Supabase connections
+def verify_supabase_connection():
+    """Verify Supabase connection and refresh if needed"""
+    global supabase
+    
+    try:
+        # Try a simple operation to check connection
+        test_result = supabase.auth.get_session()
+        if test_result:
+            return True
+    except Exception as e:
+        st.warning(f"Supabase connection issue: {str(e)}")
+        
+    # Try to reinitialize the connection
+    try:
+        st.info("Attempting to refresh Supabase connection...")
+        # First try to get credentials from Streamlit secrets
+        supabase_url = st.secrets.get("SUPABASE_URL")
+        supabase_key = st.secrets.get("SUPABASE_KEY")
+        
+        # Fall back to environment variables if not found in secrets
+        if not supabase_url:
+            supabase_url = os.environ.get("SUPABASE_URL")
+        if not supabase_key:
+            supabase_key = os.environ.get("SUPABASE_KEY")
+        
+        if supabase_url and supabase_key:
+            supabase = create_client(supabase_url, supabase_key)
+            st.success("Supabase connection refreshed!")
+            return True
+        else:
+            st.error("Supabase credentials not found!")
+            return False
+    except Exception as refresh_error:
+        st.error(f"Failed to refresh Supabase connection: {str(refresh_error)}")
+        return False
 
 def setup_bucket_permissions():
     """Set appropriate permissions for the transcripts bucket"""
@@ -665,6 +601,10 @@ def chunk_text(text, chunk_size=4000, chunk_overlap=200):
     start = 0
     text_length = len(text)
     
+    # Preprocess text for better chunking
+    # Replace excessive newlines with single newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
     while start < text_length:
         end = min(start + chunk_size, text_length)
         
@@ -683,9 +623,21 @@ def chunk_text(text, chunk_size=4000, chunk_overlap=200):
                 sentence_break = text.rfind('. ', start, end)
                 if sentence_break != -1 and sentence_break > start + chunk_size // 3:
                     end = sentence_break + 2  # Include the period and space
+                else:
+                    # If no good breaks found, look for any punctuation followed by space
+                    for punct in ['? ', '! ', '; ', ': ']:
+                        punct_break = text.rfind(punct, start, end)
+                        if punct_break != -1 and punct_break > start + chunk_size // 3:
+                            end = punct_break + 2  # Include the punct and space
+                            break
         
-        # Add the chunk
-        chunks.append(text[start:end])
+        # Get the chunk
+        chunk = text[start:end].strip()
+        
+        # Only add non-empty chunks with substantial content (at least 100 chars)
+        if chunk and len(chunk) > 100:
+            chunks.append(chunk)
+        
         start = end
     
     return chunks
@@ -713,14 +665,64 @@ def batch_upsert_chunks(chunks, metadata, batch_size=50):
     successful_upserts = 0
     
     # Process chunks in batches
+    total_batches = (len(chunks) - 1) // batch_size + 1
+    
+    # Check for the course_name and transcript_name in metadata
+    course_name = metadata.get('course_name', 'unknown_course') 
+    transcript_name = metadata.get('transcript_name', 'unknown_document')
+    
+    # Create a unique namespace prefix for this document to avoid overwriting
+    namespace_prefix = f"{course_name}_{metadata.get('week_number', '0')}"
+    
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
+        current_batch = i // batch_size + 1
         
-        with st.spinner(f"Processing batch {i//batch_size + 1} of {(len(chunks)-1)//batch_size + 1}..."):
-            for chunk in batch:
-                success, message = upsert_to_pinecone(chunk, metadata)
+        with st.spinner(f"Indexing batch {current_batch}/{total_batches} ({len(batch)} chunks)..."):
+            # First check if batch already exists by checking first and last chunk
+            if current_batch == 1:  # Only check the first batch
+                try:
+                    # Try to remove existing vectors for this document to avoid duplicates
+                    query_text = f"Delete existing vectors for {course_name} week {metadata.get('week_number', '0')} {transcript_name}"
+                    
+                    # Use a dummy embedding to find vectors with matching metadata
+                    embed_model = OpenAIEmbedding()
+                    dummy_embedding = embed_model.get_text_embedding(query_text)
+                    
+                    # Build filter to find vectors for this document
+                    filter_dict = {
+                        "course_name": {"$eq": course_name},
+                        "transcript_name": {"$eq": transcript_name}
+                    }
+                    if 'week_number' in metadata:
+                        filter_dict["week_number"] = {"$eq": metadata['week_number']}
+                    
+                    try:
+                        # Try to delete with filter (only works with some Pinecone plans)
+                        st.info(f"Removing existing vectors for {transcript_name} to avoid duplicates...")
+                        pinecone_index.delete(
+                            namespace="coursera",
+                            filter=filter_dict
+                        )
+                        st.success("Successfully deleted existing vectors")
+                    except Exception as delete_error:
+                        st.warning(f"Could not delete with filter. Proceeding with new indexing: {str(delete_error)}")
+                        # Just continue with the upsert if delete fails
+                except Exception as check_error:
+                    st.warning(f"Error checking for existing vectors: {str(check_error)}")
+            
+            # Process the current batch
+            for j, chunk in enumerate(batch):
+                # Add chunk number to metadata for better tracking
+                chunk_metadata = metadata.copy()
+                chunk_metadata["chunk_number"] = i + j + 1
+                chunk_metadata["total_chunks"] = len(chunks)
+                
+                success, message = upsert_to_pinecone(chunk, chunk_metadata)
                 if success:
                     successful_upserts += 1
+                else:
+                    st.warning(f"Failed to index chunk {i+j+1}: {message}")
                     
     return successful_upserts, len(chunks)
 
@@ -738,98 +740,99 @@ def upsert_to_pinecone(text, metadata):
             return False, "No text or APIs not configured"
         
         # Create a unique ID for this vector
-        vector_id = f"{metadata['course_name']}_{metadata['week_number']}_{uuid.uuid4()}"
+        course_name = metadata.get('course_name', 'unknown')
+        week_number = metadata.get('week_number', '0')
         
-        # Check if the index supports integrated embeddings (field_map)
-        try:
-            index_desc = pinecone_index.describe_index_stats()
-            if hasattr(index_desc, 'dimension'):
-                # This is a standard vector index, we need to generate embeddings ourselves
-                embed_model = OpenAIEmbedding()
-                
-                # Retry logic for API connection errors
-                max_retries = 3
-                retry_count = 0
-                embedding = None
-                
-                while retry_count < max_retries:
-                    try:
+        # Add a timestamp and unique identifier to avoid collisions
+        timestamp = int(time.time())
+        random_id = str(uuid.uuid4())[:8]
+        vector_id = f"{course_name}_{week_number}_{timestamp}_{random_id}"
+        
+        # Truncate long text for metadata storage and clean it
+        truncated_text = text[:800].replace("\n", " ").strip()
+        
+        # Standardize metadata values for compatibility
+        clean_metadata = {}
+        for key, value in metadata.items():
+            # Convert all values to strings for consistency
+            if value is None:
+                clean_value = "none"
+            elif isinstance(value, (int, float)):
+                clean_value = str(value)
+            elif isinstance(value, str):
+                clean_value = value.strip()
+            else:
+                clean_value = str(value)
+            
+            clean_metadata[key] = clean_value
+            
+        # Add text preview to metadata
+        clean_metadata["text"] = truncated_text
+        
+        # Try with multiple retry attempts for API issues
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Check if the index supports integrated embeddings (field_map)
+                try:
+                    index_desc = pinecone_index.describe_index_stats()
+                    if hasattr(index_desc, 'dimension'):
+                        # This is a standard vector index, we need to generate embeddings ourselves
+                        embed_model = OpenAIEmbedding()
                         embedding = embed_model.get_text_embedding(text)
-                        break
-                    except Exception as e:
-                        if "APIConnectionError" in str(e) or "Connection error" in str(e):
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                wait_time = 1 * (2 ** retry_count)  # Exponential backoff
-                                st.warning(f"API connection error, retrying in {wait_time} seconds...")
-                                time.sleep(wait_time)
+                        
+                        # Upsert the vector
+                        pinecone_index.upsert(
+                            vectors=[(
+                                vector_id, 
+                                embedding, 
+                                clean_metadata
+                            )],
+                            namespace="coursera"
+                        )
+                        return True, f"Indexed content with ID: {vector_id}"
+                    else:
+                        # This might be an index with integrated embedding
+                        try:
+                            # Use the newer upsert_records which can automatically convert text to vectors
+                            pinecone_index.upsert_records(
+                                namespace="coursera",
+                                records=[{
+                                    "_id": vector_id,
+                                    "chunk_text": text,  # Will be converted to vector automatically
+                                    **clean_metadata  # Include all metadata
+                                }]
+                            )
+                            return True, f"Indexed text with ID: {vector_id} using integrated embedding"
+                        except Exception as e:
+                            if "no text embedding field_map" in str(e).lower():
+                                # Fall back to the manual approach
+                                raise
                             else:
-                                st.error("Maximum retries reached for embedding API")
-                                return False, f"Embedding API connection error after {max_retries} retries"
-                        else:
-                            raise
-                
-                if embedding:
+                                raise
+                except Exception as e:
+                    # Fall back to the basic upsert method
+                    embed_model = OpenAIEmbedding()
+                    embedding = embed_model.get_text_embedding(text)
+                    
                     # Upsert the vector
                     pinecone_index.upsert(
                         vectors=[(
                             vector_id, 
                             embedding, 
-                            {
-                                "text": text[:1000],  # Store first 1000 chars of text
-                                "course_name": metadata["course_name"],
-                                "week_number": metadata["week_number"],
-                                "transcript_name": metadata["transcript_name"]
-                            }
+                            clean_metadata
                         )],
                         namespace="coursera"
                     )
-                    return True, f"Indexed content with ID: {vector_id}"
+                    return True, f"Indexed content with ID: {vector_id} (fallback method)"
+                
+            except Exception as retry_error:
+                if attempt < max_retries - 1:
+                    wait_time = 1 * (2 ** attempt)  # Exponential backoff
+                    time.sleep(wait_time)
                 else:
-                    return False, "Failed to generate embedding"
-            else:
-                # This might be an index with integrated embedding
-                try:
-                    # Use the newer upsert_records which can automatically convert text to vectors
-                    pinecone_index.upsert_records(
-                        namespace="coursera",
-                        records=[{
-                            "_id": vector_id,
-                            "chunk_text": text,  # Will be converted to vector automatically
-                            "course_name": metadata["course_name"],
-                            "week_number": metadata["week_number"],
-                            "transcript_name": metadata["transcript_name"]
-                        }]
-                    )
-                    return True, f"Indexed text with ID: {vector_id} using integrated embedding"
-                except Exception as e:
-                    if "no text embedding field_map" in str(e).lower():
-                        st.warning("Index doesn't support integrated embedding. Falling back to manual embedding.")
-                        # Fall back to the manual approach
-                        raise
-                    else:
-                        raise
-        except Exception as e:
-            # Fall back to the basic upsert method
-            embed_model = OpenAIEmbedding()
-            embedding = embed_model.get_text_embedding(text)
-            
-            # Upsert the vector
-            pinecone_index.upsert(
-                vectors=[(
-                    vector_id, 
-                    embedding, 
-                    {
-                        "text": text[:1000],  # Store first 1000 chars of text
-                        "course_name": metadata["course_name"],
-                        "week_number": metadata["week_number"],
-                        "transcript_name": metadata["transcript_name"]
-                    }
-                )],
-                namespace="coursera"
-            )
-            return True, f"Indexed content with ID: {vector_id} (fallback method)"
-            
+                    raise retry_error
+                    
     except Exception as e:
         return False, f"Error indexing to Pinecone: {str(e)}"
 
@@ -881,6 +884,9 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
         if week_number:
             filter_dict["week_number"] = {"$eq": week_number}
         
+        # Track which approach worked for logging
+        search_method_used = "standard"
+        
         # Execute the query
         try:
             results = pinecone_index.query(
@@ -893,17 +899,33 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
             
             # Extract text from matches
             retrieved_texts = []
+            scores = []
             for match in results.matches:
                 if match.metadata and 'text' in match.metadata:
                     retrieved_texts.append(match.metadata['text'])
+                    scores.append(match.score)
+            
+            # Log search quality
+            if scores:
+                avg_score = sum(scores) / len(scores)
+                st.write(f"📊 Search quality: {avg_score:.2f} (higher is better)")
             
             if not retrieved_texts:
                 st.warning("No relevant vectors found in Pinecone. This may happen if you haven't indexed this content before.")
                 return ""
                 
-            return "\n\n".join(retrieved_texts)
+            # Format the retrieved texts with their relevance scores
+            formatted_texts = []
+            for i, (text, score) in enumerate(zip(retrieved_texts, scores)):
+                # Add a section header with relevance score
+                formatted_texts.append(f"--- Segment {i+1} (Relevance: {score:.2f}) ---\n{text}\n")
+                
+            return "\n\n".join(formatted_texts)
         except Exception as query_error:
-            st.warning(f"Error in Pinecone query: {str(query_error)}")
+            st.warning(f"Error in standard Pinecone query: {str(query_error)}")
+            search_method_used = "fallback"
+            
+            # If filtering is not supported, try the fallback approach
             if "not supported" in str(query_error).lower():
                 # If filtering is not supported, try without filters
                 try:
@@ -916,6 +938,7 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
                     
                     # Manually filter results
                     filtered_texts = []
+                    scores = []
                     for match in results.matches:
                         metadata = match.metadata
                         if not metadata:
@@ -929,9 +952,17 @@ def semantic_search_with_pinecone(query, course_name=None, week_number=None, top
                             
                         if 'text' in metadata:
                             filtered_texts.append(metadata['text'])
+                            scores.append(match.score)
+                    
+                    # Format the retrieved texts with their relevance scores
+                    formatted_texts = []
+                    for i, (text, score) in enumerate(zip(filtered_texts, scores)):
+                        # Add a section header with relevance score
+                        formatted_texts.append(f"--- Segment {i+1} (Relevance: {score:.2f}) ---\n{text}\n")
                             
                     if filtered_texts:
-                        return "\n\n".join(filtered_texts)
+                        st.info(f"Used fallback search method with manual filtering ({len(filtered_texts)} results)")
+                        return "\n\n".join(formatted_texts)
                     else:
                         return ""
                 except Exception as fallback_error:
@@ -1213,6 +1244,136 @@ def verify_and_fix_storage():
     except Exception as e:
         st.error(f"Error verifying storage: {str(e)}")
 
+# Modify the get_file_from_supabase function to be more resilient
+def get_file_from_supabase(file_path):
+    """Download a file from Supabase storage and return its contents"""
+    global supabase
+    
+    # Sanitize file path - remove any whitespace or newlines
+    clean_path = file_path.strip()
+    
+    # Skip if empty path
+    if not clean_path:
+        return None
+    
+    # Ensure we're using the correct project
+    project_id = "vmppiyatjirgfeqlgswm"
+    project_url = f"https://{project_id}.supabase.co"
+    
+    # Log information about the connection
+    st.info(f"Connecting to Supabase project: {project_id}")
+    st.info(f"Attempting to access file: {clean_path}")
+        
+    # Try to get the file from Supabase
+    for attempt in range(2):  # Make up to 2 attempts
+        try:
+            # Ensure connection is valid
+            if attempt > 0:
+                verify_supabase_connection()
+            
+            # On second attempt, try creating a new client specifically for this project
+            if attempt == 1:
+                st.info("Trying with direct project connection...")
+                try:
+                    # Use environment variables or secrets
+                    api_key = supabase_key or os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
+                    if not api_key:
+                        st.error("No API key available for Supabase")
+                        return None
+                    
+                    # Create a direct client to the specific project
+                    direct_client = create_client(project_url, api_key)
+                    
+                    # Try download with the direct client
+                    response = direct_client.storage.from_("transcripts").download(clean_path)
+                    if response:
+                        st.success(f"Successfully downloaded '{clean_path}' from Supabase using direct connection!")
+                        return response
+                except Exception as direct_error:
+                    st.error(f"Direct connection failed: {str(direct_error)}")
+                
+            # Get direct info about the bucket
+            try:
+                all_buckets = supabase.storage.list_buckets()
+                bucket_names = [b.get('name') for b in all_buckets]
+                if 'transcripts' not in bucket_names:
+                    st.error("'transcripts' bucket not found in your Supabase project!")
+                    st.write(f"Available buckets: {', '.join(bucket_names)}")
+                    st.info(f"Make sure your project ID is correct: {project_id}")
+                else:
+                    st.success("'transcripts' bucket found!")
+            except Exception as bucket_error:
+                st.warning(f"Could not check buckets: {str(bucket_error)}")
+            
+            # Try to list files to verify bucket access
+            try:
+                bucket_files = supabase.storage.from_("transcripts").list()
+                st.write(f"Files in Supabase 'transcripts' bucket: {[f.get('name') for f in bucket_files]}")
+                if not any(f.get('name') == clean_path for f in bucket_files):
+                    st.warning(f"File '{clean_path}' not found among the {len(bucket_files)} files in the bucket")
+                    # Look for similar files
+                    similar_files = [f.get('name') for f in bucket_files if f.get('name') and 
+                                    (clean_path.lower() in f.get('name').lower() or 
+                                     f.get('name').lower() in clean_path.lower())]
+                    if similar_files:
+                        st.info(f"Similar files found: {', '.join(similar_files)}")
+                        st.info("If one of these is the file you want, try using one of these instead:")
+                        # Create buttons for each similar file
+                        for similar_file in similar_files[:3]:  # Limit to first 3 to avoid too many buttons
+                            if st.button(f"Try '{similar_file}'", key=f"try_{similar_file}"):
+                                # Try to download this similar file instead
+                                try:
+                                    alt_response = supabase.storage.from_("transcripts").download(similar_file)
+                                    if alt_response:
+                                        st.success(f"Successfully downloaded '{similar_file}' instead!")
+                                        return alt_response
+                                except Exception as alt_error:
+                                    st.error(f"Error downloading alternative file: {str(alt_error)}")
+            except Exception as list_error:
+                st.warning(f"Could not list files in bucket: {str(list_error)}")
+                
+            # Attempt actual download
+            response = supabase.storage.from_("transcripts").download(clean_path)
+            if response:
+                st.success(f"Successfully downloaded '{clean_path}' from Supabase!")
+                return response
+        except Exception as e:
+            st.error(f"Error downloading file from Supabase (attempt {attempt+1}): {str(e)}")
+            if attempt == 0:
+                st.info("Trying again with refreshed connection...")
+            
+    # If Supabase download failed, try local files
+    st.warning("Supabase download failed. Trying local files...")
+    local_paths = [
+        file_path,  # Try direct path
+        file_path.strip(),  # Try without whitespace
+        os.path.join(os.getcwd(), file_path.strip()),  # Try in current directory
+        os.path.join(os.path.expanduser("~"), "Downloads", file_path.strip())  # Try in Downloads folder
+    ]
+    
+    for path in local_paths:
+        if os.path.exists(path):
+            st.success(f"Found file locally at '{path}', using this instead")
+            with open(path, "rb") as f:
+                return f.read()
+    
+    # Last resort: Try direct URL access if possible (for public files)
+    try:
+        st.info("Attempting direct URL access as last resort...")
+        public_url = f"https://{project_id}.supabase.co/storage/v1/object/public/transcripts/{clean_path}"
+        st.info(f"Trying URL: {public_url}")
+        
+        response = requests.get(public_url)
+        if response.status_code == 200:
+            st.success("Successfully downloaded file via public URL!")
+            return response.content
+        else:
+            st.error(f"Public URL access failed with status code: {response.status_code}")
+    except Exception as url_error:
+        st.error(f"Error with direct URL access: {str(url_error)}")
+    
+    return None
+
 # Main application logic for each tab
 with tab1:
     st.header("Upload Coursera Transcripts")
@@ -1485,179 +1646,9 @@ CREATE TABLE transcripts (
 with tab2:
     st.header("Summarize Transcripts")
     
-    # Add an expanded credentials section in the Check Supabase Storage expander
+    # Add simplified storage checker expander
     with st.expander("🔍 Check Supabase Storage", expanded=True):
-        st.write("### Supabase Credentials")
-        st.info("Your Supabase buckets appear to be inaccessible. Let's verify your credentials.")
-        
-        # Show current credentials (masked)
-        supabase_url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
-        supabase_key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
-        
-        # Mask credentials for display
-        masked_url = supabase_url[:20] + "..." + supabase_url[-10:] if len(supabase_url) > 30 else supabase_url
-        masked_key = supabase_key[:5] + "..." + supabase_key[-5:] if len(supabase_key) > 10 else supabase_key
-        
-        st.write(f"**Current URL:** `{masked_url}`")
-        st.write(f"**Current Key:** `{masked_key}`")
-        
-        # Add manual credential entry
-        st.write("### Update Credentials")
-        st.write("You can temporarily update your Supabase credentials here:")
-        
-        # Save credentials in session state if they don't exist
-        if "manual_supabase_url" not in st.session_state:
-            st.session_state.manual_supabase_url = supabase_url
-        if "manual_supabase_key" not in st.session_state:
-            st.session_state.manual_supabase_key = supabase_key
-            
-        # Input fields for credentials
-        new_url = st.text_input("Supabase URL", 
-                               value=st.session_state.manual_supabase_url,
-                               help="Find this in your Supabase dashboard under Project Settings > API",
-                               key="input_supabase_url")
-        new_key = st.text_input("Supabase API Key", 
-                               value=st.session_state.manual_supabase_key,
-                               help="Use the 'anon' key from Project Settings > API",
-                               type="password",
-                               key="input_supabase_key")
-        
-        # Update button
-        if st.button("Update Credentials"):
-            try:
-                # Use a temporary variable first, only update global after successful test
-                st.session_state.manual_supabase_url = new_url
-                st.session_state.manual_supabase_key = new_key
-                
-                # Try to create a new client with these credentials
-                temp_client = create_client(new_url, new_key)
-                
-                # Test with a simple operation
-                test_result = temp_client.auth.get_session()
-                
-                # If successful, update the client
-                supabase = temp_client
-                
-                st.success("✅ Credentials updated and connection successful!")
-                
-                # Try to list buckets with new credentials
-                try:
-                    buckets = supabase.storage.list_buckets()
-                    if buckets:
-                        st.success(f"Found {len(buckets)} buckets: {[b.get('name') for b in buckets]}")
-                    else:
-                        st.warning("Connection successful but no buckets found.")
-                except Exception as bucket_error:
-                    st.error(f"Connection successful but bucket access failed: {str(bucket_error)}")
-            except Exception as e:
-                st.error(f"Failed to connect with new credentials: {str(e)}")
-        
-        # Add direct API test button
-        if st.button("Test Direct API Access"):
-            try:
-                # Use current credentials (either from session state or environment)
-                current_url = st.session_state.get("manual_supabase_url") or supabase_url
-                current_key = st.session_state.get("manual_supabase_key") or supabase_key
-                
-                if not current_url or not current_key:
-                    st.error("Missing URL or API key")
-                else:
-                    # Remove any trailing slashes from URL
-                    api_url = current_url.rstrip("/")
-                    
-                    # Create headers for requests
-                    headers = {
-                        "apikey": current_key,
-                        "Authorization": f"Bearer {current_key}"
-                    }
-                    
-                    # Use httpx for direct API calls
-                    import httpx
-                    
-                    # Test connection to Supabase REST API
-                    st.write("Testing REST API connection...")
-                    with httpx.Client(headers=headers) as client:
-                        # Try to access storage API
-                        storage_url = f"{api_url}/storage/v1/bucket"
-                        storage_response = client.get(storage_url)
-                        
-                        if storage_response.status_code == 200:
-                            buckets = storage_response.json()
-                            st.success(f"✅ Direct storage API access successful! Found {len(buckets)} buckets")
-                            st.json(buckets)
-                            
-                            # If transcripts bucket exists, try to list files
-                            transcript_bucket = next((b for b in buckets if b.get('name') == 'transcripts'), None)
-                            if transcript_bucket:
-                                files_url = f"{api_url}/storage/v1/object/list/transcripts"
-                                files_response = client.get(files_url)
-                                
-                                if files_response.status_code == 200:
-                                    files = files_response.json()
-                                    st.success(f"✅ Found {len(files)} files in the transcripts bucket!")
-                                    # Create a file list table
-                                    if files:
-                                        file_table = []
-                                        for file in files:
-                                            file_table.append({
-                                                "Name": file.get("name", ""),
-                                                "Size": f"{int(file.get('metadata', {}).get('size', 0) / 1024)} KB",
-                                                "Last Modified": file.get("created_at", "")
-                                            })
-                                        st.table(file_table)
-                                else:
-                                    st.error(f"❌ Failed to list files: {files_response.status_code} - {files_response.text}")
-                        else:
-                            st.error(f"❌ Storage API access failed: {storage_response.status_code} - {storage_response.text}")
-            except Exception as api_error:
-                st.error(f"Direct API test failed: {str(api_error)}")
-                import traceback
-                st.code(traceback.format_exc())
-        
-        # Add the standard diagnostic buttons in a row
-        col1, col2, col3 = st.columns([1, 1, 1])
-        
-        with col1:
-            if st.button("Test Connection"):
-                with st.spinner("Testing Supabase connection..."):
-                    if verify_supabase_connection():
-                        st.success("✅ Supabase connection is working")
-                    else:
-                        st.error("❌ Supabase connection failed")
-        
-        with col2:
-            if st.button("List Buckets"):
-                try:
-                    buckets = supabase.storage.list_buckets()
-                    if buckets:
-                        st.success(f"Found {len(buckets)} buckets")
-                        st.write([bucket.get('name') for bucket in buckets])
-                    else:
-                        st.warning("No buckets found")
-                except Exception as e:
-                    st.error(f"Error listing buckets: {str(e)}")
-        
-        with col3:
-            if st.button("List Files"):
-                try:
-                    files = supabase.storage.from_("transcripts").list()
-                    if files:
-                        st.success(f"Found {len(files)} files in 'transcripts' bucket")
-                        # Display file list in a table
-                        file_data = []
-                        for file in files:
-                            file_data.append({
-                                "Name": file.get("name", "Unknown"),
-                                "Size": f"{int(file.get('metadata', {}).get('size', 0) / 1024)} KB",
-                                "Last Modified": file.get("created_at", "Unknown")
-                            })
-                        st.table(file_data)
-                    else:
-                        st.warning("No files found in 'transcripts' bucket")
-                except Exception as e:
-                    st.error(f"Error listing files: {str(e)}")
-                
-        # Continue with existing Quick Upload functionality
+        # Add direct file upload for quick fixes
         st.write("### Quick Upload")
         upload_course = st.text_input("Course Name", placeholder="e.g., AI For Everyone", key="quick_upload_course")
         upload_week = st.number_input("Week Number", min_value=1, max_value=20, value=1, key="quick_upload_week")
@@ -1665,7 +1656,16 @@ with tab2:
         
         if upload_file and upload_course and st.button("Upload to Supabase"):
             try:
-                # Generate clean file name
+                # First check if bucket exists, create if not
+                try:
+                    buckets = supabase.storage.list_buckets()
+                    if not any(bucket['name'] == 'transcripts' for bucket in buckets):
+                        st.warning("'transcripts' bucket not found. Creating it now...")
+                        supabase.storage.create_bucket("transcripts", {"public": "true"})
+                except Exception as bucket_error:
+                    st.error(f"Error checking buckets: {str(bucket_error)}")
+                
+                # Generate clean filename
                 clean_filename = f"{upload_course.replace(' ', '_')}_{upload_week}_{upload_file.name.replace(' ', '_')}"
                 
                 # Upload file
@@ -1692,6 +1692,41 @@ with tab2:
                     st.info("Please refresh the page to see the new file in the dropdown")
             except Exception as e:
                 st.error(f"Error during quick upload: {str(e)}")
+                
+        # Add diagnostic buttons in a row
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("Setup Storage"):
+                with st.spinner("Setting up storage..."):
+                    setup_bucket_permissions()
+        
+        with col2:
+            if st.button("List Files"):
+                try:
+                    buckets = supabase.storage.list_buckets()
+                    if not any(bucket['name'] == 'transcripts' for bucket in buckets):
+                        st.warning("'transcripts' bucket not found. Creating it now...")
+                        supabase.storage.create_bucket("transcripts", {"public": "true"})
+                        st.success("Created 'transcripts' bucket")
+                    
+                    files = supabase.storage.from_("transcripts").list()
+                    if files:
+                        st.success(f"Found {len(files)} files in 'transcripts' bucket")
+                        for file in files:
+                            st.write(f"- {file.get('name', 'Unknown')} ({int(file.get('metadata', {}).get('size', 0) / 1024)} KB)")
+                    else:
+                        st.warning("No files found in 'transcripts' bucket")
+                except Exception as e:
+                    st.error(f"Error listing files: {str(e)}")
+        
+        with col3:
+            if st.button("Test Connection"):
+                with st.spinner("Testing connection..."):
+                    if verify_supabase_connection():
+                        st.success("✅ Supabase connection is working")
+                    else:
+                        st.error("❌ Supabase connection failed")
     
     # Check if any files exist in the database table
     try:
@@ -1728,6 +1763,12 @@ with tab2:
         
         if selected_week and st.button("Generate Summary"):
             with st.spinner("Generating summary..."):
+                # Show Pinecone indexing status
+                if ENABLE_PINECONE_INDEXING:
+                    st.info("🔄 Pinecone vector indexing is ENABLED. Text will be converted to embeddings and stored in Pinecone.")
+                else:
+                    st.info("ℹ️ Pinecone vector indexing is disabled. Text will not be stored as embeddings.")
+                
                 try:
                     # Fetch transcripts for the selected course and week
                     response = supabase.table("transcripts").select("*").eq("course_name", selected_course).eq("week_number", selected_week).execute()
@@ -1754,99 +1795,124 @@ with tab2:
                             file_path = transcript["file_path"]
                             st.write(f"Processing {file_path}...")
                             
-                            # Extract text from the PDF
-                            text = extract_text_from_supabase_pdf(file_path)
+                            # Check if this transcript is already indexed in Pinecone
+                            if ENABLE_PINECONE_INDEXING:
+                                already_indexed = check_if_already_indexed(
+                                    selected_course, 
+                                    selected_week, 
+                                    transcript.get("transcript_name", file_path)
+                                )
+                                if already_indexed:
+                                    st.info(f"📊 Content from {file_path} is already indexed in Pinecone")
+                                else:
+                                    st.info(f"🆕 Content from {file_path} will be indexed in Pinecone")
+                            
+                            # First check if the bucket exists
+                            try:
+                                buckets = supabase.storage.list_buckets()
+                                if not any(bucket['name'] == 'transcripts' for bucket in buckets):
+                                    # Create the bucket if it doesn't exist
+                                    st.warning("'transcripts' bucket not found. Creating it now...")
+                                    supabase.storage.create_bucket("transcripts", {"public": "true"})
+                            except Exception as bucket_error:
+                                st.error(f"Error checking buckets: {str(bucket_error)}")
+                                # Continue anyway as we might be able to find the file locally
+                            
+                            # Try multiple approaches to get file content
+                            text = None
+                            
+                            # First, try direct database storage (if file_path starts with DB_)
+                            if file_path.startswith("DB_"):
+                                try:
+                                    filename = file_path[3:].strip()
+                                    db_results = supabase.table("file_contents").select("*").ilike("file_name", filename).execute()
+                                    if db_results.data:
+                                        st.success(f"Found file '{filename}' in database storage")
+                                        file_record = db_results.data[0]
+                                        file_data = base64.b64decode(file_record["file_data"])
+                                        text = extract_text_from_file(file_data, filename)
+                                except Exception as db_error:
+                                    st.warning(f"Could not retrieve from database: {str(db_error)}")
+                            
+                            # If not found in DB, try Supabase storage
+                            if not text:
+                                try:
+                                    file_data = get_file_from_supabase(file_path)
+                                    if file_data:
+                                        text = extract_text_from_file(file_data, file_path)
+                                except Exception as storage_error:
+                                    st.warning(f"Error accessing storage: {str(storage_error)}")
+                            
+                            # If still not found, try local files with common variations
+                            if not text:
+                                home_dir = os.path.expanduser("~")
+                                base_name = os.path.basename(file_path.strip())
+                                local_paths = [
+                                    file_path,
+                                    os.path.join(os.getcwd(), base_name),
+                                    os.path.join(home_dir, "Downloads", base_name),
+                                    os.path.join(os.getcwd(), "transcripts", base_name),
+                                    # Try with and without underscores
+                                    os.path.join(os.getcwd(), base_name.replace("_", " ")),
+                                    os.path.join(os.getcwd(), base_name.replace(" ", "_"))
+                                ]
+                                
+                                for path in local_paths:
+                                    if os.path.exists(path):
+                                        st.success(f"Found file locally at '{path}'")
+                                        try:
+                                            with open(path, "rb") as f:
+                                                file_data = f.read()
+                                                text = extract_text_from_file(file_data, path)
+                                                break
+                                        except Exception as read_error:
+                                            st.error(f"Error reading file: {str(read_error)}")
+                            
+                            # Add text to the combined content
                             if text:
                                 all_text += text + "\n\n"
+                                st.success(f"Successfully extracted text from {file_path}")
                                 
-                                # Check if this specific transcript is already indexed
-                                if not check_if_already_indexed(selected_course, selected_week, transcript["transcript_name"]):
-                                    # Only index if not already present
-                                    st.info(f"Indexing new content from {file_path}...")
-                                    # Index this content using our direct function instead of LlamaIndex
-                                    chunks = chunk_text(text, chunk_size=1000, chunk_overlap=200)
-                                    
-                                    # Process in batches
-                                    successful, total = batch_upsert_chunks(
-                                        chunks,
-                                        {
-                                            "course_name": selected_course,
-                                            "week_number": selected_week,
-                                            "transcript_name": transcript["transcript_name"]
-                                        },
-                                        batch_size=20
-                                    )
-                                    
-                                    if successful > 0:
-                                        st.success(f"Indexed {successful}/{total} chunks from {file_path}")
-                                    else:
-                                        st.warning(f"Failed to index content from {file_path}")
-                                else:
-                                    st.info(f"Content from {file_path} already indexed, skipping...")
-                            else:
-                                st.warning(f"Could not extract text from {file_path}")
-                        
-                        if all_text:
-                            try:
-                                # Check if summary content is already indexed
-                                if not check_if_already_indexed(selected_course, selected_week, "summary"):
-                                    # First, ensure the content is indexed
-                                    chunks = chunk_text(all_text, chunk_size=1000, chunk_overlap=200)
-                                    
-                                    with st.spinner("Indexing content for retrieval..."):
-                                        # Process chunks in batches
-                                        successful, total = batch_upsert_chunks(
-                                            # Limit to 30 chunks to avoid overwhelming the API
-                                            chunks[:min(30, len(chunks))],
-                                            {
+                                # Index the extracted text to Pinecone
+                                if ENABLE_PINECONE_INDEXING:
+                                    with st.spinner(f"Creating vector embeddings for {file_path}..."):
+                                        try:
+                                            # Split text into manageable chunks
+                                            chunks = chunk_text(text, chunk_size=4000, chunk_overlap=200)
+                                            
+                                            # Prepare metadata for the chunks
+                                            metadata = {
                                                 "course_name": selected_course,
                                                 "week_number": selected_week,
-                                                "transcript_name": "summary"
-                                            },
-                                            batch_size=10  # Smaller batch size for more frequent updates
-                                        )
-                                        
-                                        if successful > 0:
-                                            st.success(f"Successfully indexed {successful}/{min(30, total)} chunks")
-                                        else:
-                                            st.warning("Could not index any chunks, will use direct text processing")
-                                else:
-                                    st.info("Summary content already indexed, using existing vectors...")
-                                
-                                # Now perform semantic search for relevant content
-                                with st.spinner("Performing semantic search for relevant concepts..."):
-                                    summary_query = f"key concepts and main takeaways from {selected_course} week {selected_week}"
-                                    relevant_content = ""
-                                    
-                                    try:
-                                        relevant_content = semantic_search_with_pinecone(
-                                            summary_query, 
-                                            course_name=selected_course, 
-                                            week_number=selected_week,
-                                            top_k=5
-                                        )
-                                        
-                                        if relevant_content:
-                                            st.info(f"Found {len(relevant_content.split())} words of relevant content")
-                                    except Exception as search_error:
-                                        st.warning(f"Semantic search error: {str(search_error)}. Using full content instead.")
-                                        relevant_content = ""
-                                
-                                # If we got relevant content, use it for the summary
-                                context_for_summary = relevant_content if relevant_content else all_text[:12000]
-                                
-                                # Generate summary with Gemini
+                                                "transcript_name": transcript.get("transcript_name", file_path)
+                                            }
+                                            
+                                            # Store chunks in Pinecone
+                                            success_count, total_count = batch_upsert_chunks(chunks, metadata)
+                                            
+                                            st.success(f"✅ Successfully indexed {success_count}/{total_count} chunks to Pinecone")
+                                        except Exception as index_error:
+                                            st.error(f"Error indexing to Pinecone: {str(index_error)}")
+                            else:
+                                st.error(f"Could not extract text from {file_path}")
+                        
+                        if not all_text:
+                            st.error("Could not extract text from any of the transcripts.")
+                            st.info("Please try the Quick Upload feature to add your files.")
+                        else:
+                            try:
+                                # Use Gemini to generate summary
                                 prompt = f"""Generate a concise summary (250-300 words) of the following Coursera content for {selected_course}, Week {selected_week}. 
                                 Focus on key concepts, important definitions, and main takeaways.
 
                                 CONTENT:
-                                {context_for_summary}"""
+                                {all_text[:15000]}"""
                                 
                                 response = get_gemini_response(prompt)
                                 
                                 if response:
                                     st.subheader(f"Summary for {selected_course}, Week {selected_week}")
-                                    st.write(response)
+                                    st.markdown(response)
                                     
                                     # Add download button
                                     st.download_button(
@@ -1855,31 +1921,157 @@ with tab2:
                                         file_name=f"{selected_course}_Week{selected_week}_Summary.txt",
                                         mime="text/plain"
                                     )
+                                    
+                                    # Show Pinecone index stats
+                                    if ENABLE_PINECONE_INDEXING:
+                                        with st.expander("📊 Pinecone Vector Index Stats", expanded=False):
+                                            try:
+                                                stats = pinecone_index.describe_index_stats()
+                                                total_vectors = stats.get('total_vector_count', 0)
+                                                
+                                                st.write("### Pinecone Index Statistics")
+                                                st.write(f"Total vectors: {total_vectors}")
+                                                
+                                                # Show namespace stats if available
+                                                if 'namespaces' in stats and 'coursera' in stats.get('namespaces', {}):
+                                                    coursera_stats = stats['namespaces']['coursera']
+                                                    st.write(f"Vectors in 'coursera' namespace: {coursera_stats.get('vector_count', 0)}")
+                                                
+                                                st.success("✅ Your content is now vectorized and can be searched semantically!")
+                                            except Exception as stats_error:
+                                                st.error(f"Error fetching Pinecone stats: {str(stats_error)}")
                                 else:
-                                    st.error("Failed to generate summary with Gemini")
-                            except Exception as e:
-                                st.error(f"Error generating summary: {str(e)}")
-                                # Fallback to simple summarization
-                                try:
-                                    prompt = f"""Generate a concise summary (250-300 words) of the following Coursera content for {selected_course}, Week {selected_week}. 
-                                    Focus on key concepts, important definitions, and main takeaways.
-                                    
-                                    CONTENT:
-                                    {all_text[:10000]}"""
-                                    
-                                    response = get_gemini_response(prompt)
-                                    if response:
-                                        st.subheader(f"Summary for {selected_course}, Week {selected_week} (Fallback Method)")
-                                        st.write(response)
-                                except Exception as fallback_error:
-                                    st.error(f"Even fallback summarization failed: {str(fallback_error)}")
-                        else:
-                            st.error("Could not extract text from any of the transcripts.")
+                                    st.error("Failed to generate summary with Gemini API. Please check your API key configuration.")
+                            except Exception as summary_error:
+                                st.error(f"Error generating summary: {str(summary_error)}")
                 except Exception as e:
                     st.error(f"Error generating summary: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
 
 with tab3:
     st.header("Ask Questions")
+    
+    # Show RAG status information
+    if ENABLE_PINECONE_INDEXING:
+        try:
+            stats = pinecone_index.describe_index_stats()
+            total_vectors = stats.get('total_vector_count', 0)
+            namespaces = stats.get('namespaces', {})
+            
+            # Check for the 'coursera' namespace specifically
+            coursera_vectors = 0
+            if 'coursera' in namespaces:
+                coursera_vectors = namespaces['coursera'].get('vector_count', 0)
+            
+            if total_vectors > 0:
+                st.success(f"✅ Vector database is active with {total_vectors} total vectors")
+                if coursera_vectors > 0:
+                    st.success(f"✅ Found {coursera_vectors} vectors in 'coursera' namespace for search")
+                else:
+                    st.warning("⚠️ No vectors found in 'coursera' namespace. Content may not be properly indexed.")
+            else:
+                st.warning("⚠️ No vectors found in Pinecone. Please generate summaries first to create embeddings.")
+                st.info("Step 1: Go to the 'Summarize' tab\nStep 2: Select a course and week\nStep 3: Click 'Generate Summary' to create vector embeddings")
+                
+            # Add Vector Diagnostics section
+            with st.expander("🔧 Vector Coverage Diagnostics", expanded=False):
+                st.write("### Vector Storage Diagnostics")
+                
+                # Display namespace statistics
+                st.write("#### Namespace Statistics")
+                for namespace, ns_stats in namespaces.items():
+                    st.write(f"- **{namespace}**: {ns_stats.get('vector_count', 0)} vectors")
+                
+                # Add option to reindex all content
+                st.write("#### Reindex Content")
+                st.write("If you're getting poor retrieval results, you can reindex all content to improve vector quality.")
+                
+                if st.button("🔄 Reindex All Content"):
+                    with st.spinner("Fetching available transcripts..."):
+                        try:
+                            # Get all transcripts from database
+                            response = supabase.table("transcripts").select("*").execute()
+                            
+                            if not response.data:
+                                st.error("No transcripts found in database.")
+                                st.stop()
+                                
+                            st.success(f"Found {len(response.data)} transcripts. Starting reindexing process...")
+                            
+                            # Process each transcript
+                            total_chunks = 0
+                            successful_chunks = 0
+                            
+                            progress_bar = st.progress(0)
+                            for i, transcript in enumerate(response.data):
+                                file_path = transcript["file_path"]
+                                course_name = transcript["course_name"]
+                                week_number = transcript["week_number"]
+                                transcript_name = transcript.get("transcript_name", file_path)
+                                
+                                st.write(f"Processing {file_path}...")
+                                
+                                # Extract text from file
+                                text = None
+                                try:
+                                    file_data = get_file_from_supabase(file_path)
+                                    if file_data:
+                                        text = extract_text_from_file(file_data, file_path)
+                                except Exception as extract_error:
+                                    st.error(f"Error extracting text: {str(extract_error)}")
+                                
+                                if text:
+                                    # Split into chunks and index
+                                    chunks = chunk_text(text, chunk_size=2000, chunk_overlap=200)  # Smaller chunks for better retrieval
+                                    
+                                    # Prepare metadata
+                                    metadata = {
+                                        "course_name": course_name,
+                                        "week_number": week_number,
+                                        "transcript_name": transcript_name
+                                    }
+                                    
+                                    # Index chunks
+                                    success_count, total_count = batch_upsert_chunks(chunks, metadata)
+                                    
+                                    total_chunks += total_count
+                                    successful_chunks += success_count
+                                    
+                                    st.write(f"✅ Indexed {success_count}/{total_count} chunks for {file_path}")
+                                else:
+                                    st.error(f"Could not extract text from {file_path}")
+                                
+                                # Update progress
+                                progress_bar.progress((i + 1) / len(response.data))
+                            
+                            # Show final results
+                            if total_chunks > 0:
+                                st.success(f"Reindexing complete! Successfully indexed {successful_chunks}/{total_chunks} chunks ({successful_chunks/total_chunks*100:.1f}%)")
+                            else:
+                                st.error("No content was indexed. Please check your files and try again.")
+                        except Exception as reindex_error:
+                            st.error(f"Error during reindexing: {str(reindex_error)}")
+                
+                # Add test query to evaluate retrieval quality
+                st.write("#### Test Vector Retrieval")
+                test_query = st.text_input("Enter a test query to evaluate retrieval quality")
+                test_k = st.slider("Number of results", min_value=1, max_value=10, value=3)
+                
+                if test_query and st.button("Run Test Query"):
+                    with st.spinner("Running test query..."):
+                        result = semantic_search_with_pinecone(test_query, top_k=test_k)
+                        if result:
+                            st.success("✅ Retrieved content successfully!")
+                            st.write(result)
+                        else:
+                            st.error("No relevant content found. Your vectors may be missing or of poor quality.")
+                
+        except Exception as pinecone_error:
+            st.error(f"❌ Error connecting to Pinecone: {str(pinecone_error)}")
+            st.info("Please check your Pinecone API key and settings")
+    else:
+        st.warning("⚠️ Vector indexing is disabled. Enable it in the configuration to improve search quality.")
     
     # Chat history in session state
     if "messages" not in st.session_state:
@@ -1915,6 +2107,13 @@ with tab3:
     with col2:
         selected_week = st.selectbox("Filter by Week", ["All Weeks"] + [str(w) for w in weeks] if weeks else ["All Weeks"], key="chat_week")
     
+    # RAG search settings
+    with st.expander("🔍 Search Settings", expanded=False):
+        top_k = st.slider("Number of chunks to retrieve", min_value=3, max_value=15, value=5, 
+                          help="Higher values retrieve more content but may include less relevant information")
+        use_chat_history = st.checkbox("Use chat history for context", value=True,
+                                      help="Includes previous messages as context for better continuity")
+    
     # Get user input
     user_query = st.chat_input("Ask about your Coursera content")
     
@@ -1926,49 +2125,82 @@ with tab3:
         
         # Generate AI response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
+            with st.spinner("Searching knowledge base..."):
                 try:
-                    # Build query to get relevant files
-                    query = supabase.table("transcripts").select("*")
+                    # Check if Pinecone is accessible
+                    try:
+                        stats = pinecone_index.describe_index_stats()
+                        total_vectors = stats.get('total_vector_count', 0)
+                        if total_vectors == 0:
+                            st.warning("No vectors found in Pinecone. Please generate summaries first to create embeddings.")
+                            ai_response = "I can't answer your question because there's no content in the vector database. Please use the 'Summarize' tab to process some course content first."
+                            st.write(ai_response)
+                            st.session_state.messages.append({"role": "assistant", "content": ai_response})
+                            st.stop()
+                    except Exception as pinecone_error:
+                        st.error(f"Error connecting to Pinecone: {str(pinecone_error)}")
+                        ai_response = "I'm having trouble connecting to the knowledge base. Please check the Pinecone connection and try again."
+                        st.write(ai_response)
+                        st.session_state.messages.append({"role": "assistant", "content": ai_response})
+                        st.stop()
                     
-                    if selected_course != "All Courses" and selected_course != "No courses available":
-                        query = query.eq("course_name", selected_course)
+                    # Build search parameters
+                    course_filter = None if selected_course == "All Courses" else selected_course
+                    week_filter = None if selected_week == "All Weeks" else int(selected_week)
                     
-                    if selected_week != "All Weeks":
-                        query = query.eq("week_number", int(selected_week))
+                    # Create search query (potentially incorporating chat history)
+                    search_query = user_query
+                    if use_chat_history and len(st.session_state.messages) > 1:
+                        # Get last few messages to provide context (limiting to last 3 exchanges)
+                        recent_messages = st.session_state.messages[-6:] if len(st.session_state.messages) > 6 else st.session_state.messages
+                        context_messages = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_messages[:-1]])
+                        search_query = f"Context: {context_messages}\n\nCurrent question: {user_query}"
                     
-                    response = query.execute()
+                    # Perform semantic search
+                    st.info("🔍 Searching for relevant content in vector database...")
+                    retrieved_text = semantic_search_with_pinecone(
+                        search_query, 
+                        course_name=course_filter, 
+                        week_number=week_filter, 
+                        top_k=top_k
+                    )
                     
-                    if not response.data:
-                        st.warning("No transcripts found for the selected filters.")
-                        ai_response = "I don't have any information for your query. Please check if you have uploaded relevant transcripts and selected the correct course/week."
-                    else:
-                        # Process the PDFs to extract text
-                        st.info(f"Searching through {len(response.data)} transcript(s)...")
+                    if not retrieved_text:
+                        # Try without filters if no results
+                        if course_filter or week_filter:
+                            st.info("No results with filters. Trying broader search...")
+                            retrieved_text = semantic_search_with_pinecone(search_query, top_k=top_k)
                         
-                        all_text = ""
-                        for transcript in response.data:
-                            file_path = transcript["file_path"]
-                            # Extract text from the PDF
-                            text = extract_text_from_supabase_pdf(file_path)
-                            if text:
-                                all_text += f"\n\n--- {transcript['transcript_name']} ---\n\n{text}"
-                        
-                        if not all_text:
-                            ai_response = "I couldn't extract text from any of the transcripts. Please check if the PDFs are valid and try again."
-                        else:
-                            # If content is too large, truncate
-                            max_length = 14000  # Conservative max for context
-                            if len(all_text) > max_length:
-                                st.warning("The transcript content is very large. Only using the first portion for the response.")
-                                all_text = all_text[:max_length] + "..."
-                            
-                            # Use Gemini to generate response
-                            prompt = f"Here is the transcript content:\n\n{all_text}\n\nBased only on this content, please answer the following question:\n{user_query}"
-                            ai_response = get_gemini_response(prompt)
-                            
-                            if not ai_response:
-                                ai_response = "I'm having trouble generating a response. Please try again or check the system configuration."
+                        # If still no results
+                        if not retrieved_text:
+                            st.warning("No relevant content found in the vector database.")
+                            ai_response = "I couldn't find any relevant information about this topic in the course materials. Please try a different question or upload more content."
+                            st.write(ai_response)
+                            st.session_state.messages.append({"role": "assistant", "content": ai_response})
+                            st.stop()
+                    
+                    # Show retrieved chunks in expandable section
+                    with st.expander("📄 Retrieved Content", expanded=False):
+                        st.write("The following content was retrieved from the vector database:")
+                        st.text(retrieved_text[:1500] + "..." if len(retrieved_text) > 1500 else retrieved_text)
+                    
+                    # Generate answer with Gemini
+                    st.info("🤖 Generating answer based on retrieved content...")
+                    prompt = f"""You are an educational AI assistant helping students understand Coursera content.
+                    
+                    Answer the question based ONLY on the following information from course materials:
+                    
+                    {retrieved_text}
+                    
+                    Question: {user_query}
+                    
+                    Answer in a clear, direct manner. Be sure to highlight key concepts and provide well-structured information.
+                    If information to answer the question is not contained in the retrieved content, say so directly."""
+                    
+                    ai_response = get_gemini_response(prompt)
+                    
+                    if not ai_response:
+                        ai_response = "I'm having trouble generating a response. Please try again or check the system configuration."
                     
                     st.write(ai_response)
                     st.session_state.messages.append({"role": "assistant", "content": ai_response})
