@@ -17,6 +17,7 @@ import time
 from httpx import Client
 import requests
 import re
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -621,11 +622,28 @@ def get_gemini_response(prompt, context=None, temperature=0.2, max_tokens=4000, 
         st.error(f"Error getting Gemini response: {str(e)}")
         return None
 
-def chunk_text(text, chunk_size=4000, chunk_overlap=200):
-    """Split text into smaller chunks with some overlap for better context preservation."""
+def chunk_text(text, chunk_size=512, chunk_overlap=100):
+    """Split text into smaller chunks with significant overlap for better context preservation.
+    
+    Uses smaller chunks (512 tokens) with 100 token overlap to create more precise vectors
+    that better capture semantic relationships while preventing concept fragmentation.
+    
+    Args:
+        text: The text to split into chunks
+        chunk_size: Size of each chunk in approximate tokens (default: 512)
+        chunk_overlap: Overlap between chunks in tokens (default: 100)
+        
+    Returns:
+        List of text chunks
+    """
     if not text:
         return []
         
+    # Convert token-based parameters to character-based approximations
+    # Assuming average of 4 chars per token for English text
+    char_size = chunk_size * 4
+    char_overlap = chunk_overlap * 4
+    
     chunks = []
     start = 0
     text_length = len(text)
@@ -633,52 +651,86 @@ def chunk_text(text, chunk_size=4000, chunk_overlap=200):
     # Preprocess text for better chunking
     # Replace excessive newlines with single newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
+    # Replace tabs with spaces
+    text = text.replace('\t', ' ')
+    # Normalize spaces
+    text = re.sub(r' {2,}', ' ', text)
     
-    while start < text_length:
-        end = min(start + chunk_size, text_length)
-        
-        # If this is not the first chunk, include some overlap
-        if start > 0:
-            start = max(0, start - chunk_overlap)
-            
-        # Try to find a good breaking point (sentence or paragraph end)
-        if end < text_length:
-            # Look for paragraph break first
-            paragraph_break = text.rfind('\n\n', start, end)
-            if paragraph_break != -1 and paragraph_break > start + chunk_size // 2:
-                end = paragraph_break + 2  # Include the newlines
+    # Track semantic units like paragraphs to avoid breaking them across chunks
+    paragraphs = re.split(r'\n\s*\n', text)
+    
+    current_chunk = ""
+    for paragraph in paragraphs:
+        # If adding this paragraph would exceed chunk size and we already have content
+        if len(current_chunk) + len(paragraph) > char_size and current_chunk:
+            # Store the current chunk
+            chunks.append(current_chunk.strip())
+            # Start new chunk with overlap from previous chunk
+            overlap_start = max(0, len(current_chunk) - char_overlap)
+            current_chunk = current_chunk[overlap_start:] + "\n\n" + paragraph
+        else:
+            # Add paragraph to current chunk
+            if current_chunk:
+                current_chunk += "\n\n" + paragraph
             else:
-                # Look for sentence break (period followed by space)
-                sentence_break = text.rfind('. ', start, end)
-                if sentence_break != -1 and sentence_break > start + chunk_size // 3:
-                    end = sentence_break + 2  # Include the period and space
-                else:
-                    # If no good breaks found, look for any punctuation followed by space
-                    for punct in ['? ', '! ', '; ', ': ']:
-                        punct_break = text.rfind(punct, start, end)
-                        if punct_break != -1 and punct_break > start + chunk_size // 3:
-                            end = punct_break + 2  # Include the punct and space
-                            break
-        
-        # Get the chunk
-        chunk = text[start:end].strip()
-        
-        # Only add non-empty chunks with substantial content (at least 100 chars)
-        if chunk and len(chunk) > 100:
-            chunks.append(chunk)
-        
-        start = end
+                current_chunk = paragraph
     
-    return chunks
+    # Add the last chunk if it has content
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    # For very long paragraphs that exceed chunk size, split them further
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) <= char_size:
+            final_chunks.append(chunk)
+        else:
+            # Split long chunk into smaller pieces
+            sub_chunks = []
+            for i in range(0, len(chunk), char_size - char_overlap):
+                sub_chunk = chunk[i:i+char_size]
+                
+                # Try to find good breaking points if not at the start
+                if i > 0:
+                    # Look for sentence breaks (period, question mark, exclamation)
+                    for punct in ['. ', '? ', '! ']:
+                        punct_pos = sub_chunk.find(punct, char_overlap)
+                        if punct_pos != -1:
+                            # Adjust to include the punctuation
+                            punct_pos += 2  
+                            sub_chunk = sub_chunk[:punct_pos]
+                            break
+                
+                if sub_chunk:
+                    sub_chunks.append(sub_chunk)
+            
+            final_chunks.extend(sub_chunks)
+    
+    # Final cleanup: ensure minimum chunk size and remove duplicates
+    result_chunks = []
+    min_chunk_length = 100  # Minimum characters for a meaningful chunk
+    
+    for chunk in final_chunks:
+        chunk = chunk.strip()
+        if len(chunk) >= min_chunk_length:
+            # Check if this chunk is mostly duplicate of previous chunk
+            if result_chunks and chunk in result_chunks[-1]:
+                continue
+            result_chunks.append(chunk)
+    
+    # Log info about chunks
+    st.info(f"Created {len(result_chunks)} text chunks with avg {sum(len(c) for c in result_chunks)/max(1, len(result_chunks)):.0f} chars per chunk")
+    
+    return result_chunks
 
-def batch_upsert_chunks(chunks, metadata, batch_size=50):
+def batch_upsert_chunks(chunks, metadata, batch_size=40):
     """
-    Process and upsert multiple chunks in batches
+    Process and upsert multiple chunks in batches with improved vector quality
     
     Args:
         chunks: List of text chunks to process
         metadata: Dictionary with common metadata for all chunks
-        batch_size: Number of chunks to process in each batch
+        batch_size: Number of chunks to process in each batch (default: 40)
         
     Returns:
         Tuple of (success_count, total_count)
@@ -693,65 +745,97 @@ def batch_upsert_chunks(chunks, metadata, batch_size=50):
     
     successful_upserts = 0
     
-    # Process chunks in batches
+    # Calculate expected storage
+    avg_vector_size_kb = 4  # 4KB per vector is a reasonable estimate
+    expected_storage_mb = (len(chunks) * avg_vector_size_kb) / 1024
+    st.info(f"Preparing to index {len(chunks)} chunks (~{expected_storage_mb:.1f} MB of vector storage)")
+    
+    # Process chunks in batches to avoid overwhelming the API
     total_batches = (len(chunks) - 1) // batch_size + 1
     
     # Check for the course_name and transcript_name in metadata
     course_name = metadata.get('course_name', 'unknown_course') 
     transcript_name = metadata.get('transcript_name', 'unknown_document')
     
-    # Create a unique namespace prefix for this document to avoid overwriting
-    namespace_prefix = f"{course_name}_{metadata.get('week_number', '0')}"
+    # Create a unique namespace prefix for this document
+    document_id = f"{course_name}_{metadata.get('week_number', '0')}_{uuid.uuid4().hex[:8]}"
     
+    # First, delete existing vectors for this document to avoid duplicates
+    try:
+        # Create a filter to find vectors for this document
+        filter_dict = {
+            "course_name": {"$eq": course_name},
+            "transcript_name": {"$eq": transcript_name}
+        }
+        if 'week_number' in metadata:
+            filter_dict["week_number"] = {"$eq": metadata['week_number']}
+        
+        # Try to delete with filter
+        st.info(f"Removing existing vectors for '{transcript_name}' to avoid duplicates...")
+        try:
+            # Attempt to use the delete with filter operation
+            pinecone_index.delete(
+                namespace="coursera",
+                filter=filter_dict
+            )
+            st.success("✅ Successfully deleted existing vectors")
+        except Exception as delete_error:
+            if "not supported" in str(delete_error).lower():
+                st.warning("Filter-based deletion not supported by your Pinecone plan.")
+                st.warning("Will proceed with adding new vectors. You may see duplicates in search results.")
+            else:
+                st.warning(f"Could not delete existing vectors: {str(delete_error)}")
+    except Exception as e:
+        st.warning(f"Error preparing for vector upload: {str(e)}")
+    
+    # Progress tracking
+    progress_bar = st.progress(0)
+    
+    # Process chunks in batches
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
         current_batch = i // batch_size + 1
         
         with st.spinner(f"Indexing batch {current_batch}/{total_batches} ({len(batch)} chunks)..."):
-            # First check if batch already exists by checking first and last chunk
-            if current_batch == 1:  # Only check the first batch
-                try:
-                    # Try to remove existing vectors for this document to avoid duplicates
-                    query_text = f"Delete existing vectors for {course_name} week {metadata.get('week_number', '0')} {transcript_name}"
-                    
-                    # Use a dummy embedding to find vectors with matching metadata
-                    embed_model = OpenAIEmbedding()
-                    dummy_embedding = embed_model.get_text_embedding(query_text)
-                    
-                    # Build filter to find vectors for this document
-                    filter_dict = {
-                        "course_name": {"$eq": course_name},
-                        "transcript_name": {"$eq": transcript_name}
-                    }
-                    if 'week_number' in metadata:
-                        filter_dict["week_number"] = {"$eq": metadata['week_number']}
-                    
-                    try:
-                        # Try to delete with filter (only works with some Pinecone plans)
-                        st.info(f"Removing existing vectors for {transcript_name} to avoid duplicates...")
-                        pinecone_index.delete(
-                            namespace="coursera",
-                            filter=filter_dict
-                        )
-                        st.success("Successfully deleted existing vectors")
-                    except Exception as delete_error:
-                        st.warning(f"Could not delete with filter. Proceeding with new indexing: {str(delete_error)}")
-                        # Just continue with the upsert if delete fails
-                except Exception as check_error:
-                    st.warning(f"Error checking for existing vectors: {str(check_error)}")
-            
-            # Process the current batch
+            # Process each chunk in the batch
             for j, chunk in enumerate(batch):
-                # Add chunk number to metadata for better tracking
+                # Create enhanced metadata with detailed tracking info
                 chunk_metadata = metadata.copy()
                 chunk_metadata["chunk_number"] = i + j + 1
                 chunk_metadata["total_chunks"] = len(chunks)
+                chunk_metadata["document_id"] = document_id
+                chunk_metadata["chunk_index"] = j
+                chunk_metadata["batch_index"] = current_batch
+                chunk_metadata["chars"] = len(chunk)
+                chunk_metadata["tokens"] = len(chunk) // 4  # Rough approximation
                 
+                # Add timestamp for freshness tracking
+                chunk_metadata["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Add digest/hash for duplicate detection
+                import hashlib
+                chunk_metadata["content_hash"] = hashlib.md5(chunk.encode()).hexdigest()
+                
+                # Upsert the vector
                 success, message = upsert_to_pinecone(chunk, chunk_metadata)
                 if success:
                     successful_upserts += 1
                 else:
-                    st.warning(f"Failed to index chunk {i+j+1}: {message}")
+                    st.warning(f"Failed to index chunk {i+j+1}/{len(chunks)}: {message}")
+                
+            # Update progress after each batch
+            progress_bar.progress(min(1.0, (i + len(batch)) / len(chunks)))
+    
+    # Report final statistics
+    if successful_upserts > 0:
+        success_rate = (successful_upserts / len(chunks)) * 100
+        st.success(f"✅ Successfully indexed {successful_upserts}/{len(chunks)} chunks ({success_rate:.1f}%)")
+        
+        # Estimate storage used
+        storage_used_mb = (successful_upserts * avg_vector_size_kb) / 1024
+        st.info(f"Approximate vector storage used: {storage_used_mb:.1f} MB")
+    else:
+        st.error("❌ Failed to index any chunks. Check the logs for errors.")
                     
     return successful_upserts, len(chunks)
 
@@ -2071,6 +2155,40 @@ with tab3:
                 st.write("#### Reindex Content")
                 st.write("If you're getting poor retrieval results, you can reindex all content to improve vector quality.")
                 
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    chunk_size = st.number_input("Chunk Size (tokens)", 
+                                                min_value=128, 
+                                                max_value=2048, 
+                                                value=512, 
+                                                step=128,
+                                                help="Smaller chunks (512) give more precise results, larger chunks (1024+) provide more context")
+                
+                with col2:
+                    chunk_overlap = st.number_input("Chunk Overlap (tokens)", 
+                                                  min_value=32, 
+                                                  max_value=512, 
+                                                  value=100,
+                                                  step=32,
+                                                  help="Higher overlap (100+) prevents concepts from breaking across chunks")
+                
+                # Calculate approximate vector counts and storage
+                transcript_count = 0
+                try:
+                    response = supabase.table("transcripts").select("count", "exact").execute()
+                    transcript_count = len(response.data) if response.data else 0
+                except:
+                    pass
+                
+                # Estimate vectors
+                avg_transcript_pages = 10  # Rough estimate
+                avg_chunks_per_page = (700 // (chunk_size / 4)) * 1.1  # Assuming avg 700 chars per page, adjusted for overlap
+                estimated_chunks = transcript_count * avg_transcript_pages * avg_chunks_per_page
+                estimated_storage_mb = estimated_chunks * 4 / 1024  # 4KB per vector
+                
+                st.info(f"Estimated: ~{int(estimated_chunks)} vectors ({estimated_storage_mb:.1f} MB storage) for {transcript_count} transcripts")
+                
                 if st.button("🔄 Reindex All Content"):
                     with st.spinner("Fetching available transcripts..."):
                         try:
@@ -2106,14 +2224,20 @@ with tab3:
                                     st.error(f"Error extracting text: {str(extract_error)}")
                                 
                                 if text:
-                                    # Split into chunks and index
-                                    chunks = chunk_text(text, chunk_size=2000, chunk_overlap=200)  # Smaller chunks for better retrieval
+                                    # Show text statistics 
+                                    st.info(f"Extracted {len(text):,} characters of text ({len(text.split())} words)")
                                     
-                                    # Prepare metadata
+                                    # Split into chunks with user-specified parameters
+                                    chunks = chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                                    
+                                    # Prepare metadata with improved tracking
                                     metadata = {
                                         "course_name": course_name,
                                         "week_number": week_number,
-                                        "transcript_name": transcript_name
+                                        "transcript_name": transcript_name,
+                                        "file_path": file_path,
+                                        "reindexed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        "chunk_settings": f"{chunk_size}_{chunk_overlap}"
                                     }
                                     
                                     # Index chunks
@@ -2121,8 +2245,6 @@ with tab3:
                                     
                                     total_chunks += total_count
                                     successful_chunks += success_count
-                                    
-                                    st.write(f"✅ Indexed {success_count}/{total_count} chunks for {file_path}")
                                 else:
                                     st.error(f"Could not extract text from {file_path}")
                                 
@@ -2131,7 +2253,15 @@ with tab3:
                             
                             # Show final results
                             if total_chunks > 0:
-                                st.success(f"Reindexing complete! Successfully indexed {successful_chunks}/{total_chunks} chunks ({successful_chunks/total_chunks*100:.1f}%)")
+                                success_rate = (successful_chunks / total_chunks) * 100
+                                st.success(f"Reindexing complete! Successfully indexed {successful_chunks:,}/{total_chunks:,} chunks ({success_rate:.1f}%)")
+                                
+                                # Estimate storage used
+                                storage_used_mb = (successful_chunks * 4) / 1024  # 4KB per vector
+                                st.info(f"Approximate vector storage used: {storage_used_mb:.1f} MB")
+                                
+                                # Show instructions on how to verify
+                                st.info("To verify improved search quality, try using the Test Vector Retrieval tool below")
                             else:
                                 st.error("No content was indexed. Please check your files and try again.")
                         except Exception as reindex_error:
